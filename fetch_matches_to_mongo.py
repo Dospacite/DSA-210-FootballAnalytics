@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
+from pymongo.operations import UpdateOne
 from requests import HTTPError, Session
 from tqdm import tqdm
 
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional MongoDB database override. Falls back to URI database or football_analytics.",
     )
     parser.add_argument(
+        "--refresh-seasons",
+        action="store_true",
+        help="Force a fresh seasons API fetch instead of resuming from cached seasons.",
+    )
+    parser.add_argument(
         "--seasons-collection",
         default="seasons",
         help="Collection used for season documents.",
@@ -108,6 +114,7 @@ def ensure_indexes(
     seasons_collection.create_index("competition_id")
     seasons_collection.create_index("end_date")
     seasons_collection.create_index("is_ended")
+    seasons_collection.create_index("meta.fetched")
 
     schedules_collection.create_index("sport_event_id", unique=True)
     schedules_collection.create_index("season_id")
@@ -120,6 +127,7 @@ def ensure_indexes(
     matches_collection.create_index("sport_event_id")
     matches_collection.create_index("match_date_utc")
     matches_collection.create_index("competition.competition_id")
+
 
 
 def is_ended_season(season: dict[str, Any], reference_date: date) -> bool:
@@ -163,6 +171,16 @@ def build_season_document(season: dict[str, Any], *, fetched_at: datetime, refer
         "fetched_at": fetched_at,
         "raw": season,
     }
+
+
+def load_cached_seasons(seasons_collection: Collection) -> list[dict[str, Any]]:
+    seasons = []
+    cursor = seasons_collection.find({}, {"_id": 0, "raw": 1})
+    for document in cursor:
+        raw = document.get("raw")
+        if isinstance(raw, dict):
+            seasons.append(raw)
+    return seasons
 
 
 def extract_competitor(competitors: list[dict[str, Any]], qualifier: str) -> dict[str, Any]:
@@ -232,6 +250,7 @@ def build_match_document(
     info = extract_lmt_section(lmt_bundle["match_info"])
     detailsextended = extract_lmt_section(lmt_bundle["match_detailsextended"])
     phrases = extract_lmt_section(lmt_bundle["match_phrases"])
+    squads = extract_lmt_section(lmt_bundle["match_squads"])
 
     timeline_match = timeline.get("data", {}).get("match", {})
     info_data = info.get("data", {})
@@ -257,6 +276,7 @@ def build_match_document(
                 "match_info",
                 "match_detailsextended",
                 "match_phrases",
+                "match_squads",
             ],
         },
         "competition": {
@@ -295,6 +315,7 @@ def build_match_document(
             "match_info": info,
             "match_detailsextended": detailsextended,
             "match_phrases": phrases,
+            "match_squads": squads,
         },
         "raw": {
             "season_schedule_item": schedule_item,
@@ -310,10 +331,27 @@ def upsert_seasons(
     fetched_at: datetime,
     reference_date: date,
 ) -> None:
+    operations = []
     with tqdm(seasons, desc="Seasons", unit="season", dynamic_ncols=True) as season_bar:
         for season in season_bar:
             document = build_season_document(season, fetched_at=fetched_at, reference_date=reference_date)
-            seasons_collection.replace_one({"season_id": document["season_id"]}, document, upsert=True)
+            operations.append(
+                UpdateOne(
+                    {"season_id": document["season_id"]},
+                    {
+                        "$set": document,
+                        "$setOnInsert": {
+                            "meta": {
+                                "fetched": False,
+                            }
+                        },
+                    },
+                    upsert=True,
+                )
+            )
+
+    if operations:
+        seasons_collection.bulk_write(operations, ordered=False)
 
 
 def ingest_ended_seasons(
@@ -321,12 +359,14 @@ def ingest_ended_seasons(
     ended_seasons: list[dict[str, Any]],
     api_client: SportradarApiClient,
     lmt_client: LmtClient,
+    seasons_collection: Collection,
     schedules_collection: Collection,
     matches_collection: Collection,
     access_level: str,
     language: str,
     origin: str,
     match_limit: int | None,
+    resume: bool,
 ) -> tuple[int, int, int, list[str], list[int]]:
     fetched_schedule_count = 0
     fetched_match_count = 0
@@ -343,31 +383,83 @@ def ingest_ended_seasons(
                 failed_seasons.append("<missing-season-id>")
                 continue
 
-            try:
-                schedule_payload = api_client.fetch_season_schedule(season_id)
-            except Exception:
-                failed_seasons.append(season_id)
-                continue
+            season_document = seasons_collection.find_one(
+                {"season_id": season_id},
+                {"_id": 0, "meta": 1},
+            ) or {}
+            season_meta = season_document.get("meta", {})
 
-            fetched_schedule_count += 1
-            schedules = schedule_payload.get("schedules", [])
-            schedule_fetched_at = datetime.now(UTC)
+            if resume and season_meta.get("fetched"):
+                schedules = [
+                    document["raw"]
+                    for document in schedules_collection.find(
+                        {"season_id": season_id},
+                        {"_id": 0, "raw": 1},
+                    ).sort("start_time", 1)
+                    if isinstance(document.get("raw"), dict)
+                ]
 
-            for schedule_item in schedules:
-                schedule_document = build_schedule_document(schedule_item, fetched_at=schedule_fetched_at)
-                schedules_collection.replace_one(
-                    {"sport_event_id": schedule_document["sport_event_id"]},
-                    schedule_document,
-                    upsert=True,
+                # Migration may mark a season as fetched before cached schedules exist.
+                if not schedules:
+                    season_meta = {}
+
+            if not (resume and season_meta.get("fetched")):
+                try:
+                    schedule_payload = api_client.fetch_season_schedule(season_id)
+                except Exception:
+                    failed_seasons.append(season_id)
+                    continue
+
+                fetched_schedule_count += 1
+                schedules = schedule_payload.get("schedules", [])
+                schedule_fetched_at = datetime.now(UTC)
+                operations = []
+
+                for schedule_item in schedules:
+                    schedule_document = build_schedule_document(schedule_item, fetched_at=schedule_fetched_at)
+                    operations.append(
+                        UpdateOne(
+                            {"sport_event_id": schedule_document["sport_event_id"]},
+                            {"$set": schedule_document},
+                            upsert=True,
+                        )
+                    )
+
+                if operations:
+                    schedules_collection.bulk_write(operations, ordered=False)
+                stored_schedule_count += len(schedules)
+                seasons_collection.update_one(
+                    {"season_id": season_id},
+                    {
+                        "$set": {
+                            "meta.fetched": True,
+                            "meta.schedule_item_count": len(schedules),
+                            "meta.schedule_fetched_at": schedule_fetched_at,
+                        }
+                    },
                 )
-                stored_schedule_count += 1
 
             if remaining_match_budget == 0:
                 break
 
-            schedule_items_for_matches = schedules
+            existing_match_ids = set(
+                matches_collection.distinct("match_id", {"season_id": season_id})
+            )
+            pending_schedule_items = []
+            for schedule_item in schedules:
+                sport_event_id = schedule_item.get("sport_event", {}).get("id")
+                if not sport_event_id:
+                    continue
+                match_id = sport_event_id_to_match_id(sport_event_id)
+                if match_id not in existing_match_ids:
+                    pending_schedule_items.append(schedule_item)
+
+            if resume and season_meta.get("fetched") and not pending_schedule_items:
+                continue
+
+            schedule_items_for_matches = pending_schedule_items
             if remaining_match_budget is not None:
-                schedule_items_for_matches = schedules[:remaining_match_budget]
+                schedule_items_for_matches = pending_schedule_items[:remaining_match_budget]
 
             with tqdm(
                 schedule_items_for_matches,
@@ -398,8 +490,10 @@ def ingest_ended_seasons(
                             upsert=True,
                         )
                         fetched_match_count += 1
+                        existing_match_ids.add(match_id)
                     except Exception:
-                        failed_matches.append(sport_event_id_to_match_id(sport_event_id))
+                        failed_match_id = sport_event_id_to_match_id(sport_event_id)
+                        failed_matches.append(failed_match_id)
 
                     if remaining_match_budget is not None:
                         remaining_match_budget -= 1
@@ -459,17 +553,23 @@ def main() -> int:
         matches_collection = database[args.matches_collection]
         ensure_indexes(seasons_collection, schedules_collection, matches_collection)
 
-        seasons_payload = api_client.fetch_seasons()
-        seasons = seasons_payload.get("seasons", [])
         reference_date = datetime.now(UTC).date()
-        seasons_fetched_at = datetime.now(UTC)
 
-        upsert_seasons(
-            seasons_collection,
-            seasons,
-            fetched_at=seasons_fetched_at,
-            reference_date=reference_date,
-        )
+        if (
+            not args.refresh_seasons
+            and seasons_collection.count_documents({}) > 0
+        ):
+            seasons = load_cached_seasons(seasons_collection)
+        else:
+            seasons_payload = api_client.fetch_seasons()
+            seasons = seasons_payload.get("seasons", [])
+            seasons_fetched_at = datetime.now(UTC)
+            upsert_seasons(
+                seasons_collection,
+                seasons,
+                fetched_at=seasons_fetched_at,
+                reference_date=reference_date,
+            )
 
         ended_seasons = [season for season in seasons if is_ended_season(season, reference_date)]
         ended_seasons.sort(key=lambda season: season.get("end_date", ""), reverse=True)
@@ -485,12 +585,14 @@ def main() -> int:
             ended_seasons=ended_seasons,
             api_client=api_client,
             lmt_client=lmt_client,
+            seasons_collection=seasons_collection,
             schedules_collection=schedules_collection,
             matches_collection=matches_collection,
             access_level=args.access_level,
             language=args.language,
             origin=args.origin,
             match_limit=args.match_limit,
+            resume=not args.refresh_seasons,
         )
     except (PyMongoError, OSError, ValueError, HTTPError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

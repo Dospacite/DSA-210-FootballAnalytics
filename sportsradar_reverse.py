@@ -206,7 +206,16 @@ class LmtClient:
     def fetch_match_phrases(self, match_id: int) -> dict[str, Any]:
         return self.fetch_endpoint("match_phrases", match_id)
 
-    def fetch_match_bundle(self, match_id: int, *, include_phrases: bool = True) -> dict[str, dict[str, Any]]:
+    def fetch_match_squads(self, match_id: int) -> dict[str, Any]:
+        return self.fetch_endpoint("match_squads", match_id)
+
+    def fetch_match_bundle(
+        self,
+        match_id: int,
+        *,
+        include_phrases: bool = True,
+        include_squads: bool = True,
+    ) -> dict[str, dict[str, Any]]:
         bundle = {
             "match_timeline": self.fetch_match_timeline(match_id),
             "match_info": self.fetch_match_info(match_id),
@@ -214,6 +223,8 @@ class LmtClient:
         }
         if include_phrases:
             bundle["match_phrases"] = self.fetch_match_phrases(match_id)
+        if include_squads:
+            bundle["match_squads"] = self.fetch_match_squads(match_id)
         return bundle
 
 
