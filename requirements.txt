@@ -1,0 +1,10 @@
+pandas
+numpy
+pymongo
+python-dotenv
+requests
+beautifulsoup4
+tqdm
+scikit-learn
+catboost
+torch
